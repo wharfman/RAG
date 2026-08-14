@@ -1,8 +1,9 @@
 from abc import ABC, abstractmethod
-from typing import List
 
-class BaseResponeseGenerator(ABC):
+from .base_datastore import SearchResult
 
+
+class BaseResponseGenerator(ABC):
     @abstractmethod
-    def generate_response(self, query: str, context: List[str]) -> str:
+    def generate_response(self, query: str, context: list[SearchResult]) -> str:
         pass

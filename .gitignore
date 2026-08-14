@@ -1,0 +1,12 @@
+venv/
+data/
+.venv/
+.env
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
+*.tsbuildinfo

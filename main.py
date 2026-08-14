@@ -1,59 +1,47 @@
-import glob
+from __future__ import annotations
+
+import argparse
 import json
-import os
-from typing import List
-from rag_pipeline import RAGPipeline
-from create_parser import create_parser
 
-from impl import Datastore, Indexer, Retriever, ResponseGenerator, Evaluator
-
-DEFAULT_SOURCE_PATH = "data/source/"
-DEFAULT_EVAL_PATH = "sample_data/eval/sample_questions.json"
+from src.config import Settings
+from src.impl import Datastore, Indexer, ResponseGenerator, Retriever
+from src.ingestion import sync_data_directory, validate_data_directory
+from src.rag_pipeline import RAGPipeline
 
 
-def create_pipeline() -> RAGPipeline:
-    """Create and return a new RAG Pipeline instance with all components."""
-    datastore = Datastore()
-    indexer = Indexer()
-    retriever = Retriever(datastore=datastore)
-    response_generator = ResponseGenerator()
-    evaluator = Evaluator()
-    return RAGPipeline(datastore, indexer, retriever, response_generator, evaluator)
+def create_pipeline(settings: Settings | None = None) -> RAGPipeline:
+    settings = settings or Settings.from_env()
+    datastore = Datastore(settings)
+    return RAGPipeline(
+        datastore=datastore,
+        indexer=Indexer(),
+        retriever=Retriever(datastore),
+        response_generator=ResponseGenerator(settings),
+    )
 
 
-def main():
-    parser = create_parser()  # Create the CLI parser
+def main() -> None:
+    parser = argparse.ArgumentParser(description="RAG pipeline CLI")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("ingest", help="Synchronize data/ into PostgreSQL/pgvector")
+    subparsers.add_parser("validate", help="Validate and chunk every supported data file")
+    subparsers.add_parser("reset", help="Reset the pgvector tables")
+    query = subparsers.add_parser("query", help="Ask a question about indexed files")
+    query.add_argument("prompt")
     args = parser.parse_args()
-    pipeline = create_pipeline()
 
-    # Process source paths and eval path
-    source_path = args.path if args.path else DEFAULT_SOURCE_PATH
-    eval_path = args.eval_file if args.eval_file else DEFAULT_EVAL_PATH
-    document_paths = get_files_in_directory(source_path)
-
-    # Execute commands
-    if args.command in ["reset", "run"]:
-        print("🗑️  Resetting the database...")
+    settings = Settings.from_env()
+    pipeline = create_pipeline(settings)
+    if args.command == "validate":
+        print(json.dumps(validate_data_directory(pipeline.indexer, settings.data_dir), indent=2))
+    elif args.command == "ingest":
+        report = sync_data_directory(pipeline.datastore, pipeline.indexer, settings.data_dir)
+        print(json.dumps(report.__dict__, indent=2))
+    elif args.command == "reset":
         pipeline.reset()
-
-    if args.command in ["add", "run"]:
-        print(f"🔍 Adding documents: {', '.join(document_paths)}")
-        pipeline.add_documents(document_paths)
-
-    if args.command in ["evaluate", "run"]:
-        print(f"📊 Evaluating using questions from: {eval_path}")
-        with open(eval_path, "r") as file:
-            sample_questions = json.load(file)
-        pipeline.evaluate(sample_questions)
-
-    if args.command == "query":
-        print(f"✨ Response: {pipeline.process_query(args.prompt)}")
-
-
-def get_files_in_directory(source_path: str) -> List[str]:
-    if os.path.isfile(source_path):
-        return [source_path]
-    return glob.glob(os.path.join(source_path, "*"))
+        print("PostgreSQL/pgvector tables reset.")
+    elif args.command == "query":
+        print(pipeline.process_query(args.prompt))
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
 from abc import ABC, abstractmethod
-from typing import List
-from interface.base_datastore import DataItem
+
+from .base_datastore import DataItem
+
 
 class BaseIndexer(ABC):
-
     @abstractmethod
-    def index(self, document_paths: List[str]) -> List[DataItem]:
+    def index(self, document_paths: list[str]) -> list[DataItem]:
         pass

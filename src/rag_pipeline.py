@@ -1,13 +1,15 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Dict, List, Optional
-from interface import (
+from pathlib import Path
+
+from src.interface import (
     BaseDatastore,
-    BaseIndexer,
-    BaseRetriever,
-    BaseResponseGenerator,
     BaseEvaluator,
+    BaseIndexer,
+    BaseResponseGenerator,
+    BaseRetriever,
     EvaluationResult,
+    SearchResult,
 )
 
 
@@ -19,35 +21,38 @@ class RAGPipeline:
     indexer: BaseIndexer
     retriever: BaseRetriever
     response_generator: BaseResponseGenerator
-    evaluator: Optional[BaseEvaluator] = None
+    evaluator: BaseEvaluator | None = None
 
     def reset(self) -> None:
         """Reset the datastore"""
         self.datastore.reset()
 
-    def add_documents(self, documents: List[str]) -> None:
-        """Index a list of documents"""
-        items = self.indexer.index(documents)
-        self.datastore.add_items(items)
-        print(f" Added {len(items)} items to the datastore")
+    def add_documents(self, documents: list[str]) -> None:
+        """Index documents using document-aware pgvector writes."""
+        for document in documents:
+            path = Path(document)
+            items = self.indexer.index_file(path)
+            self.datastore.add_document(path, self.indexer.file_hash(path), items)
+            print(f"Added {len(items)} chunks from {path.name}")
+
+    def answer_query(
+        self, query: str, history: list[dict[str, str]] | None = None
+    ) -> tuple[str, list[SearchResult]]:
+        search_results = self.retriever.search(query)
+        response = self.response_generator.generate_response(query, search_results, history)
+        return response, search_results
 
     def process_query(self, query: str) -> str:
-        search_results = self.retriever.search(query)
-        print(f" Found {len(search_results)} results for query: {query}\n")
-
-        for i, result in enumerate(search_results):
-            print(f" Result {i+1}: {result}\n")
-
-        response = self.response_generator.generate_response(query, search_results)
+        response, _ = self.answer_query(query)
         return response
 
-    def evaluate(self, sample_questions: List[Dict[str, str]]) -> List[EvaluationResult]:
+    def evaluate(self, sample_questions: list[dict[str, str]]) -> list[EvaluationResult]:
         # Evaluate a list of questions/answer pairs
         questions = [item["question"] for item in sample_questions]
         expected_answers = [item["answer"] for item in sample_questions]
 
         with ThreadPoolExecutor(max_workers=8) as executor:
-            results: List[EvaluationResult] = list(
+            results: list[EvaluationResult] = list(
                 executor.map(
                     self._evaluate_single_question,
                     questions,
@@ -57,7 +62,7 @@ class RAGPipeline:
 
         for i, result in enumerate(results):
             result_emoji = "✅" if result.is_correct else "❌"
-            print(f"{result_emoji} Q {i+1}: {result.question}: \n")
+            print(f"{result_emoji} Q {i + 1}: {result.question}: \n")
             print(f"Response: {result.response}\n")
             print(f"Expected Answer: {result.expected_answer}\n")
             print(f"Reasoning: {result.reasoning}\n")

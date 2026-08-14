@@ -1,80 +1,221 @@
-import lancedb
+from __future__ import annotations
+
+from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime
+from pathlib import Path
+
 from openai import OpenAI
-import pyarrow as pa
-from concurrent.futures import ThreadPoolExecutor
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    func,
+    select,
+    text,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
+
+from src.config import Settings
+from src.interface.base_datastore import BaseDatastore, DataItem, SearchResult
 
 
-class Datastore:
+class Base(DeclarativeBase):
+    pass
 
-    DB_PATH = "data/sample-lancedb"
-    DB_TABLE_NAME = "rag-table"
 
-    def __init__(self):
-        self.vector_dimensions = 1536 # Match OpenAI embedding model 
-        self.open_ai_client = OpenAI()
-        self.vector_db = lancedb.connect(self.DB_PATH)
-        self.table = self._get_table() # Open or creates table
+class DocumentRecord(Base):
+    __tablename__ = "documents"
 
-    def reset(self) -> Table:
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    file_name: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    indexed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
+    )
+    chunks: Mapped[list[ChunkRecord]] = relationship(
+        back_populates="document", cascade="all, delete-orphan"
+    )
+
+
+class ChunkRecord(Base):
+    __tablename__ = "chunks"
+    __table_args__ = (UniqueConstraint("document_id", "chunk_index"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    document_id: Mapped[int] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    source: Mapped[str] = mapped_column(String(768), nullable=False)
+    heading: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector(1536), nullable=False)
+    document: Mapped[DocumentRecord] = relationship(back_populates="chunks")
+
+
+class Datastore(BaseDatastore):
+    """PostgreSQL + pgvector storage and cosine-similarity retrieval."""
+
+    def __init__(self, settings: Settings | None = None):
+        self.settings = settings or Settings.from_env()
+        if self.settings.embedding_dimensions != 1536:
+            raise ValueError("The current pgvector schema requires 1536-dimensional embeddings")
+        self.engine = create_engine(
+            self.settings.database_url,
+            pool_pre_ping=True,
+            connect_args={"connect_timeout": 3},
+        )
+        self._client: OpenAI | None = None
+
+    @property
+    def client(self) -> OpenAI:
+        if self._client is None:
+            self._client = OpenAI(api_key=self.settings.require_openai_key())
+        return self._client
+
+    def initialize(self) -> None:
+        with self.engine.begin() as connection:
+            connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        Base.metadata.create_all(self.engine)
+        with self.engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw "
+                    "ON chunks USING hnsw (embedding vector_cosine_ops)"
+                )
+            )
+
+    def reset(self) -> None:
+        Base.metadata.drop_all(self.engine)
+        self.initialize()
+
+    def ping(self) -> bool:
         try:
-            self.vector_db.drop_table(self.DB_TABLE_NAME)
-        except Exception as e:
-            print("Unable to drop table.")
+            with self.engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+            return True
+        except Exception:
+            return False
 
+    def get_vector(self, content: str) -> list[float]:
+        return self.get_vectors([content])[0]
 
-        schema = pa.schema(
-            [
-                pa.field("vector", pa.list_(pa.float32(), self.vector_dimensions)),
-                pa.field("content", pa.utf8()),
-                pa.field("source", pa.utf8()),
-            ]
+    def get_vectors(self, contents: Sequence[str]) -> list[list[float]]:
+        if not contents:
+            return []
+        response = self.client.embeddings.create(
+            input=list(contents),
+            model=self.settings.embedding_model,
+            dimensions=self.settings.embedding_dimensions,
         )
-        self.vector_db.create_table(self.DB_TABLE_NAME, schema=schema)
-        self.table = self.vector_db.open_table(self.DB_TABLE_NAME)
-        print(f" Table Reset/Created: {self.DB_TABLE_NAME} in {self.DB_PATH}")
-        return self.table
+        ordered = sorted(response.data, key=lambda item: item.index)
+        return [item.embedding for item in ordered]
 
-    def get_vector(self, content: str) -> List[float]:
-        response = self.open_ai_client.embeddings.create(
-            input = content,
-            model = "text-embedding-3-small",
-            dimensions = self.vector_dimensions,
-        )
-        embeddings = response.data[0].embedding
-        return embeddings
+    def add_document(
+        self,
+        path: Path,
+        file_hash: str,
+        items: Sequence[DataItem],
+        batch_size: int = 64,
+    ) -> int:
+        embeddings: list[list[float]] = []
+        for start in range(0, len(items), batch_size):
+            embeddings.extend(
+                self.get_vectors([item.content for item in items[start : start + batch_size]])
+            )
 
-    def add_items(self, items: List[DataItem]) -> None:
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            entries = list(executor.map(self._convert_item_to_entry, items))
+        with Session(self.engine) as session, session.begin():
+            existing = session.scalar(
+                select(DocumentRecord).where(DocumentRecord.file_name == path.name)
+            )
+            if existing:
+                session.delete(existing)
+                session.flush()
+            document = DocumentRecord(
+                file_name=path.name,
+                sha256=file_hash,
+                byte_size=path.stat().st_size,
+                chunk_count=len(items),
+                indexed_at=datetime.now(UTC),
+            )
+            session.add(document)
+            session.flush()
+            session.add_all(
+                ChunkRecord(
+                    document_id=document.id,
+                    chunk_index=item.chunk_index,
+                    source=item.source,
+                    heading=item.heading,
+                    content=item.content,
+                    content_hash=item.content_hash,
+                    embedding=embedding,
+                )
+                for item, embedding in zip(items, embeddings, strict=True)
+            )
+        return len(items)
 
-        self.table.merge_insert(
-            "source"
-        ).when_matched_update_all().when_not_matched_insert_all().execute(entries)
+    def add_items(self, items: list[DataItem]) -> None:
+        raise NotImplementedError("Use add_document() so document hashes remain consistent")
 
-    def search(self, query, top_k) -> List[str]:
-        vector = self.get_vector(query)
-        results = (
-            self.table.search(vector)
-            .select(["content", "source"])
+    def remove_missing_documents(self, file_names: Iterable[str]) -> int:
+        names = set(file_names)
+        with Session(self.engine) as session, session.begin():
+            stale = list(
+                session.scalars(
+                    select(DocumentRecord).where(DocumentRecord.file_name.not_in(names))
+                )
+            )
+            for document in stale:
+                session.delete(document)
+            return len(stale)
+
+    def document_map(self) -> dict[str, dict[str, object]]:
+        with Session(self.engine) as session:
+            records = session.scalars(select(DocumentRecord).order_by(DocumentRecord.file_name))
+            return {
+                record.file_name: {
+                    "sha256": record.sha256,
+                    "byte_size": record.byte_size,
+                    "chunk_count": record.chunk_count,
+                    "indexed_at": record.indexed_at,
+                }
+                for record in records
+            }
+
+    def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
+        query_vector = self.get_vector(query)
+        distance = ChunkRecord.embedding.cosine_distance(query_vector)
+        statement = (
+            select(ChunkRecord, DocumentRecord.file_name, distance.label("distance"))
+            .join(DocumentRecord)
+            .order_by(distance)
             .limit(top_k)
-            .to_list()
         )
+        with Session(self.engine) as session:
+            rows = session.execute(statement).all()
+        return [
+            SearchResult(
+                content=chunk.content,
+                source=chunk.source,
+                file_name=file_name,
+                heading=chunk.heading,
+                score=max(0.0, 1.0 - float(distance_value)),
+            )
+            for chunk, file_name, distance_value in rows
+        ]
 
-        result_content = [result.get("content") for result in results]
-        return result_content
-
-    def _get_table(self) -> Table:
-        try:
-            return self.vector_db.open_table(self.DB_TABLE_NAME)
-        except Exception as e:
-            print(f"Error opening table. Try resetting the datastore: {e}")
-            return self.reset()
-
-    def _conver_item_to_entry(self, item) -> dict:
-        """Convert a Dataitem to match table schema."""
-        vector = self.get_vector(item.content)
-        return {
-            "vector": vector,
-            "content": item.content,
-            "source": item.source,
-        }
+    def stats(self) -> dict[str, int]:
+        with Session(self.engine) as session:
+            return {
+                "documents": session.scalar(select(func.count(DocumentRecord.id))) or 0,
+                "chunks": session.scalar(select(func.count(ChunkRecord.id))) or 0,
+            }
