@@ -10,7 +10,7 @@ The repository includes:
 - A responsive Next.js chat interface
 - A FastAPI backend for document status, ingestion, health checks, and chat
 - A Python command-line interface for validation, indexing, querying, and database reset
-- PostgreSQL 17 with pgvector for document metadata and vector search
+- PostgreSQL 17 with pgvector and full-text search for hybrid retrieval
 - Automated tests and static-analysis commands
 
 ## How it works
@@ -19,10 +19,11 @@ The repository includes:
 Files in data/
       |
       v
-Discover -> normalize -> chunk -> embed -> PostgreSQL/pgvector
-                                                   |
-User question -> embed -> cosine-similarity search |
-                                                   v
+Discover -> normalize -> chunk -> embed -> PostgreSQL/pgvector + tsvector
+                                                       |
+User question -> pgvector cosine rank -----------------|
+              -> tsvector BM25 rank -> RRF ------------|
+                                                       v
                               retrieved excerpts + recent chat history
                                                    |
                                                    v
@@ -43,8 +44,12 @@ that no longer exist in `data/`. Source files are only read; they are never rewr
 - Uses bounded, line-aware fallback chunking for plain text
 - Repairs common text-extraction encoding artifacts in memory with `ftfy`
 - Generates embeddings in batches and stores them in pgvector
-- Uses an HNSW cosine-distance index for retrieval
-- Returns the retrieved file name, section heading, source identifier, and similarity score
+- Uses an HNSW cosine-distance index for semantic retrieval
+- Uses a stored English `tsvector`, GIN index, and BM25 (`k1=1.2`, `b=0.75`)
+  for lexical retrieval
+- Fuses the independent rankings with reciprocal rank fusion (RRF, `k=60`), not
+  weighted score blending
+- Returns the retrieved file name, section heading, source identifier, and RRF score
 - Includes up to eight recent chat messages when generating an answer
 - Saves the current browser conversation in local storage
 - Shows file indexing and database status in the frontend
@@ -58,7 +63,7 @@ that no longer exist in `data/`. Source files are only read; they are never rewr
 | Styling | CSS | Responsive application layout and components |
 | Backend | Python 3.12, FastAPI, Uvicorn, Pydantic | HTTP API, validation, and application server |
 | AI | OpenAI Python SDK and Responses API | Text embeddings and grounded answer generation |
-| Database | PostgreSQL 17, pgvector, SQLAlchemy, Psycopg | Metadata, vector storage, and similarity search |
+| Database | PostgreSQL 17, pgvector, `tsvector`, SQLAlchemy, Psycopg | Metadata and hybrid search |
 | Text processing | `ftfy`, Python standard library | Encoding repair, hashing, discovery, and chunking |
 | Configuration | `python-dotenv` | Loads server settings from the root `.env` file |
 | Containers | Docker Desktop and Docker Compose | Runs the local PostgreSQL/pgvector service |
@@ -103,7 +108,7 @@ RAG/
 |   |   |-- base_response_generator.py
 |   |   `-- base_retriever.py
 |   |-- impl/                      # Current concrete implementations
-|   |   |-- datastore.py           # SQLAlchemy models, embeddings, and pgvector search
+|   |   |-- datastore.py           # pgvector + BM25 retrieval and RRF fusion
 |   |   |-- evaluator.py           # Optional model-based answer evaluator
 |   |   |-- indexer.py             # File discovery, normalization, and chunking
 |   |   |-- response_generator.py  # Grounded OpenAI response generation
@@ -113,7 +118,8 @@ RAG/
 |       `-- invoke_ai.py           # Shared OpenAI invocation helper
 `-- tests/
     |-- test_chunking.py            # Discovery, chunking, headings, and encoding tests
-    `-- test_config.py              # Default model and embedding configuration tests
+    |-- test_config.py              # Default model and embedding configuration tests
+    `-- test_hybrid_search.py       # Reciprocal rank fusion behavior tests
 ```
 
 The abstract classes under `src/interface/` separate the pipeline from its concrete
@@ -363,7 +369,7 @@ Input limits enforced by the API:
 - History roles: `user` or `assistant`
 
 The response contains `answer` plus a `sources` array. Each source includes `source`,
-`file_name`, `heading`, and a rounded cosine-similarity `score`.
+`file_name`, `heading`, and a rounded RRF `score`.
 
 ## Command-line interface
 
@@ -396,11 +402,18 @@ volume remain intact, but all documents must be ingested again.
 The database contains two application tables:
 
 - `documents`: file name, file hash, byte size, chunk count, and indexing timestamp
-- `chunks`: source, heading, content, content hash, 1,536-dimensional vector, and document
-  relationship
+- `chunks`: source, heading, content, content hash, 1,536-dimensional vector, generated
+  `tsvector`, and document relationship
 
-The `vector` extension, tables, and HNSW cosine index are created automatically during
-the first ingestion.
+The `vector` extension, tables, HNSW cosine index, and GIN full-text index are created
+automatically. On an existing database, application initialization adds the generated
+`tsvector` column and GIN index without re-embedding documents.
+
+Lexical search computes BM25 from `tsvector` position counts, per-term document
+frequency, total document count, and average document length. Semantic and lexical
+queries each return a larger candidate set. RRF then adds `1 / (60 + rank)` for every
+channel containing a chunk and returns the highest fused ranks. Raw cosine similarity
+and BM25 values are deliberately not mixed.
 
 ## Testing and code quality
 
@@ -422,7 +435,8 @@ npm run build
 
 The current tests cover default model configuration, supported-file discovery, nonempty
 and bounded chunks, unique source identifiers, Markdown heading metadata, large plain-text
-fallback chunking, and repair of common extraction mojibake.
+fallback chunking, repair of common extraction mojibake, RRF overlap behavior, raw-score
+independence, and duplicate-result handling.
 
 ## Security, privacy, and cost considerations
 
@@ -443,7 +457,8 @@ fallback chunking, and repair of common extraction mojibake.
   require a preprocessing step.
 - The embedding database schema is fixed to 1,536 dimensions.
 - File identity uses the base file name rather than its relative path.
-- Retrieval is dense vector similarity only; there is no keyword or hybrid search.
+- BM25 corpus statistics are computed at query time; very large corpora may benefit from
+  precomputed statistics or a dedicated PostgreSQL BM25 extension.
 - Browser chat history is local to one browser and is not stored by the backend.
 - The included sample data and current response-generator system prompt are AWS-oriented.
   General corpora can be indexed, but `src/impl/response_generator.py` should also be made
